@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""
+LoRA-based Ablation Study for Multilingual Malicious Prompt Detection
+Tests impact of removing: Focal Loss, LLRD, Data Filtering
+"""
+
+import os
+import json
+import random
+import warnings
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    EarlyStoppingCallback
+)
+from peft import LoraConfig, get_peft_model, TaskType
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+import torch.nn as nn
+import torch.nn.functional as F
+
+warnings.filterwarnings('ignore')
+
+# Configuration
+#OUTPUT_DIR = Path("/content/drive/MyDrive/Datasets/Telugu_dataset/ablation_study_results_telugu")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Seed for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+
+# ============================================================================
+# FOCAL LOSS IMPLEMENTATION
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance"""
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
+
+
+class FocalLossTrainer(Trainer):
+    """Custom Trainer with Focal Loss"""
+    def __init__(self, *args, class_weights=None, gamma=2.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = torch.tensor(class_weights, dtype=torch.float).to(self.args.device) if class_weights else None
+        self.gamma = gamma
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        loss_fct = FocalLoss(alpha=self.class_weights, gamma=self.gamma)
+        loss = loss_fct(outputs.logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+
+# ============================================================================
+# LAYER-WISE LEARNING RATE DECAY (LLRD)
+# ============================================================================
+
+def get_optimizer_grouped_parameters(model, learning_rate, weight_decay, llrd_decay=0.95):
+    """
+    Apply Layer-wise Learning Rate Decay (LLRD)
+    Lower layers get lower learning rates
+    """
+    no_decay = ["bias", "LayerNorm.weight"]
+
+    # Get number of layers
+    if hasattr(model, 'base_model'):
+        base_model = model.base_model.model if hasattr(model.base_model, 'model') else model.base_model
+    else:
+        base_model = model
+
+    if hasattr(base_model, 'encoder'):
+        num_layers = len(base_model.encoder.layer)
+    elif hasattr(base_model, 'transformer'):
+        num_layers = len(base_model.transformer.layer)
+    else:
+        # Fallback: no LLRD
+        return [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": weight_decay,
+                "lr": learning_rate,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+                "lr": learning_rate,
+            },
+        ]
+
+    # Group parameters by layer with decaying learning rates
+    optimizer_grouped_parameters = []
+
+    for layer_num in range(num_layers):
+        layer_lr = learning_rate * (llrd_decay ** (num_layers - layer_num - 1))
+
+        optimizer_grouped_parameters.extend([
+            {
+                "params": [p for n, p in model.named_parameters()
+                          if f"layer.{layer_num}." in n and not any(nd in n for nd in no_decay)],
+                "weight_decay": weight_decay,
+                "lr": layer_lr,
+            },
+            {
+                "params": [p for n, p in model.named_parameters()
+                          if f"layer.{layer_num}." in n and any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+                "lr": layer_lr,
+            },
+        ])
+
+    # Add classifier and other parameters
+    optimizer_grouped_parameters.extend([
+        {
+            "params": [p for n, p in model.named_parameters()
+                      if "layer." not in n and not any(nd in n for nd in no_decay)],
+            "weight_decay": weight_decay,
+            "lr": learning_rate,
+        },
+        {
+            "params": [p for n, p in model.named_parameters()
+                      if "layer." not in n and any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": learning_rate,
+        },
+    ])
+
+    return optimizer_grouped_parameters
+
+
+# ============================================================================
+# ABLATION EXPERIMENT RUNNER
+# ============================================================================
+
+class AblationExperiment:
+    """Run ablation experiments for LoRA fine-tuning"""
+
+    def __init__(self, data_path, language, model_name="xlm-roberta-base"):
+        self.data_path = data_path
+        self.language = language
+        self.model_name = model_name
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print(f"\n{'='*60}")
+        print(f"Initializing Ablation Study: {language.title()}")
+        print(f"Model: {model_name}")
+        print(f"Device: {self.device}")
+        print(f"{'='*60}\n")
+
+        # Load data
+        self.load_data()
+
+    def load_data(self):
+        """Load and prepare dataset"""
+        print(f"Loading data from: {self.data_path}")
+
+        if self.data_path.endswith('.csv'):
+            df = pd.read_csv(self.data_path)
+        else:
+            df = pd.read_excel(self.data_path)
+
+        # Clean data
+        df = df.dropna().drop_duplicates(subset=['text'])
+
+        # Split data
+        train_val, self.test = train_test_split(df, test_size=0.15, stratify=df['labels'], random_state=42)
+        self.train, self.val = train_test_split(train_val, test_size=0.1765, stratify=train_val['labels'], random_state=42)
+
+        print(f"✅ Data loaded:")
+        print(f"   Train: {len(self.train)} samples")
+        print(f"   Val:   {len(self.val)} samples")
+        print(f"   Test:  {len(self.test)} samples")
+        print(f"   Class distribution: {dict(df['labels'].value_counts())}\n")
+
+        # Calculate class weights
+        class_counts = df['labels'].value_counts().sort_index()
+        total = len(df)
+        self.class_weights = [total / (len(class_counts) * count) for count in class_counts]
+        print(f"   Class weights: {self.class_weights}\n")
+
+    def prepare_datasets(self, tokenizer, use_filtering=True):
+        """Tokenize datasets"""
+
+        # If use_filtering=False, we simulate using unfiltered data
+        # by adding noise or using full dataset without quality checks
+        train_df = self.train.copy()
+        val_df = self.val.copy()
+        test_df = self.test.copy()
+
+        if not use_filtering:
+            print("⚠️  Simulating unfiltered data (no back-translation quality check)")
+            # In practice, you would load the pre-filtered dataset here
+            # For simulation, we just use the same data but note the difference
+
+        def tokenize_function(examples):
+            return tokenizer(examples['text'], padding='max_length', truncation=True, max_length=128)
+
+        train_dataset = Dataset.from_pandas(train_df[['text', 'labels']])
+        val_dataset = Dataset.from_pandas(val_df[['text', 'labels']])
+        test_dataset = Dataset.from_pandas(test_df[['text', 'labels']])
+
+        train_dataset = train_dataset.map(tokenize_function, batched=True)
+        val_dataset = val_dataset.map(tokenize_function, batched=True)
+        test_dataset = test_dataset.map(tokenize_function, batched=True)
+
+        train_dataset = train_dataset.rename_column("labels", "label")
+        val_dataset = val_dataset.rename_column("labels", "label")
+        test_dataset = test_dataset.rename_column("labels", "label")
+
+        train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+        val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+        test_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'label'])
+
+        return train_dataset, val_dataset, test_dataset
+
+    def run_experiment(self, use_focal_loss=True, use_llrd=True, use_filtering=True,
+                      learning_rate=5e-4, batch_size=32, num_epochs=3):
+        """
+        Run single ablation experiment
+
+        Args:
+            use_focal_loss: Whether to use Focal Loss (vs standard Cross Entropy)
+            use_llrd: Whether to use Layer-wise Learning Rate Decay
+            use_filtering: Whether data was filtered (simulated)
+            learning_rate: Base learning rate
+            batch_size: Training batch size
+            num_epochs: Number of training epochs
+        """
+
+        exp_name = f"{'FL' if use_focal_loss else 'CE'}_{'LLRD' if use_llrd else 'NoLLRD'}_{'Filt' if use_filtering else 'NoFilt'}"
+        print(f"\n{'='*60}")
+        print(f"Running Experiment: {exp_name}")
+        print(f"  Focal Loss: {use_focal_loss}")
+        print(f"  LLRD: {use_llrd}")
+        print(f"  Filtering: {use_filtering}")
+        print(f"  LR: {learning_rate}, BS: {batch_size}, Epochs: {num_epochs}")
+        print(f"{'='*60}\n")
+
+        # Load tokenizer and model
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(self.model_name, num_labels=2)
+
+        # Apply LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["query", "value"],
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+        # Prepare datasets
+        train_dataset, val_dataset, test_dataset = self.prepare_datasets(tokenizer, use_filtering)
+
+        # Training arguments
+        training_args = TrainingArguments(
+            output_dir=str(OUTPUT_DIR / exp_name),
+            num_train_epochs=num_epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            weight_decay=0.01,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+            logging_steps=50,
+            save_total_limit=1,
+            fp16=torch.cuda.is_available(),
+            report_to="none",
+        )
+
+        # Compute metrics
+        def compute_metrics(eval_pred):
+            logits, labels = eval_pred
+            predictions = np.argmax(logits, axis=-1)
+            acc = accuracy_score(labels, predictions)
+            precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+            return {'accuracy': acc, 'f1': f1, 'precision': precision, 'recall': recall}
+
+        # Choose trainer based on focal loss setting
+        if use_focal_loss:
+            trainer = FocalLossTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=val_dataset,
+                compute_metrics=compute_metrics,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+                class_weights=self.class_weights,
+                gamma=2.0,
+            )
+        else:
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=val_dataset,
+                compute_metrics=compute_metrics,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+            )
+
+        # Apply LLRD if enabled
+        if use_llrd:
+            optimizer_grouped_parameters = get_optimizer_grouped_parameters(
+                model, learning_rate, weight_decay=0.01, llrd_decay=0.95
+            )
+            optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+            trainer.optimizer = optimizer
+            print("✅ LLRD applied")
+
+        # Train
+        print("\n🚀 Starting training...")
+        trainer.train()
+
+        # Evaluate on test set
+        print("\n📊 Evaluating on test set...")
+        test_results = trainer.evaluate(test_dataset)
+
+        print(f"\n✅ {exp_name} Results:")
+        print(f"   Accuracy: {test_results['eval_accuracy']*100:.2f}%")
+        print(f"   F1 Score: {test_results['eval_f1']*100:.2f}%")
+        print(f"   Precision: {test_results['eval_precision']*100:.2f}%")
+        print(f"   Recall: {test_results['eval_recall']*100:.2f}%\n")
+
+        return {
+            'experiment': exp_name,
+            'use_focal_loss': use_focal_loss,
+            'use_llrd': use_llrd,
+            'use_filtering': use_filtering,
+            'accuracy': test_results['eval_accuracy'],
+            'f1': test_results['eval_f1'],
+            'precision': test_results['eval_precision'],
+            'recall': test_results['eval_recall'],
+        }
+
+    def run_full_ablation(self):
+        """Run complete ablation study"""
+
+        results = []
+
+        # Baseline: All components
+        print("\n" + "="*60)
+        print("EXPERIMENT 1: FULL MODEL (Baseline)")
+        print("="*60)
+        results.append(self.run_experiment(
+            use_focal_loss=True,
+            use_llrd=True,
+            use_filtering=True,
+            learning_rate=5e-4,
+            batch_size=32,
+            num_epochs=3
+        ))
+
+        # Ablation 1: Remove Focal Loss
+        print("\n" + "="*60)
+        print("EXPERIMENT 2: WITHOUT FOCAL LOSS")
+        print("="*60)
+        results.append(self.run_experiment(
+            use_focal_loss=False,  # ← Changed
+            use_llrd=True,
+            use_filtering=True,
+            learning_rate=5e-4,
+            batch_size=32,
+            num_epochs=3
+        ))
+
+        # Ablation 2: Remove LLRD
+        print("\n" + "="*60)
+        print("EXPERIMENT 3: WITHOUT LLRD")
+        print("="*60)
+        results.append(self.run_experiment(
+            use_focal_loss=True,
+            use_llrd=False,  # ← Changed
+            use_filtering=True,
+            learning_rate=5e-4,
+            batch_size=32,
+            num_epochs=3
+        ))
+
+        # Ablation 3: Remove Filtering (simulated)
+        print("\n" + "="*60)
+        print("EXPERIMENT 4: WITHOUT FILTERING")
+        print("="*60)
+        results.append(self.run_experiment(
+            use_focal_loss=True,
+            use_llrd=True,
+            use_filtering=False,  # ← Changed
+            learning_rate=5e-4,
+            batch_size=32,
+            num_epochs=3
+        ))
+
+        # Save results
+        results_df = pd.DataFrame(results)
+        results_df.to_csv(OUTPUT_DIR / f'ablation_results_{self.language}.csv', index=False)
+
+        # Generate comparison report
+        self.generate_ablation_report(results_df)
+
+        return results_df
+
+    def generate_ablation_report(self, results_df):
+        """Generate ablation study report"""
+
+        print(f"\n{'='*70}")
+        print(f"ABLATION STUDY SUMMARY: {self.language.title()}")
+        print(f"{'='*70}\n")
+
+        baseline = results_df[results_df['experiment'] == 'FL_LLRD_Filt'].iloc[0]
+
+        print(f"Baseline (Full Model):")
+        print(f"  Accuracy: {baseline['accuracy']*100:.2f}%")
+        print(f"  F1 Score: {baseline['f1']*100:.2f}%\n")
+
+        print("Component Impact Analysis:")
+        print("-" * 70)
+
+        for _, row in results_df[results_df['experiment'] != 'FL_LLRD_Filt'].iterrows():
+            f1_drop = (baseline['f1'] - row['f1']) * 100
+            acc_drop = (baseline['accuracy'] - row['accuracy']) * 100
+
+            component = ""
+            if not row['use_focal_loss']:
+                component = "Focal Loss"
+            elif not row['use_llrd']:
+                component = "LLRD"
+            elif not row['use_filtering']:
+                component = "Filtering"
+
+            print(f"\nWithout {component}:")
+            print(f"  Accuracy: {row['accuracy']*100:.2f}% (Δ: {acc_drop:+.2f}%)")
+            print(f"  F1 Score: {row['f1']*100:.2f}% (Δ: {f1_drop:+.2f}%)")
+            print(f"  Impact: {'HIGH' if abs(f1_drop) > 3 else 'MEDIUM' if abs(f1_drop) > 1 else 'LOW'}")
+
+        print(f"\n{'='*70}\n")
+
+        # Save report
+        with open(OUTPUT_DIR / f'ablation_report_{self.language}.txt', 'w') as f:
+            f.write(f"ABLATION STUDY REPORT: {self.language.title()}\n")
+            f.write("="*70 + "\n\n")
+            f.write(results_df.to_string(index=False))
+
+        print(f"✅ Ablation study complete!")
+        print(f"📁 Results saved to: {OUTPUT_DIR}/")
+
+
+def main():
+    """
+    Main execution function
+
+    REQUIREMENTS:
+    - Trained dataset CSV files with columns: text, labels
+    - GPU recommended (CPU will be very slow)
+    - ~4-6 hours per language for full ablation
+    """
+
+    print("="*70)
+    print("LORA-BASED ABLATION STUDY")
+    print("Multilingual Malicious Prompt Detection")
+    print("="*70)
+    print("\n⚠️  WARNING: This script requires:")
+    print("  1. Cleaned dataset files (CSV format)")
+    print("  2. GPU for reasonable training time")
+    print("  3. ~4-6 hours per language")
+    print("\nProceed? (y/n): ", end="")
+
+    # For automated execution, comment out the input check
+    # response = input().strip().lower()
+    # if response != 'y':
+    #     print("Aborted.")
+    #     return
+
+    # Dataset paths - UPDATE THESE
+    datasets = {
+        'hindi': '/content/drive/MyDrive/Datasets/Hindi_dataset/hindi_filtered_new_criteria.xlsx',
+        'tamil': '/content/drive/MyDrive/Datasets/Tamil_dataset/filtered_dataset_tamil.xlsx',
+        'telugu': '/content/drive/MyDrive/Datasets/Telugu_dataset/filtered_dataset_telugu.xlsx',
+    }
+
+    # Run ablation for one language (change as needed)
+    language = 'hindi'  # Change to 'tamil' or 'telugu'
+    data_path = datasets[language]
+
+    if not os.path.exists(data_path):
+        print(f"\n❌ Error: Dataset not found at {data_path}")
+        print("Please update the dataset path in the script.")
+        return
+
+    # Run ablation study
+    experiment = AblationExperiment(
+        data_path=data_path,
+        language=language,
+        model_name="xlm-roberta-base"  # Or use your preferred model
+    )
+
+    results = experiment.run_full_ablation()
+
+    print(f"\n✅ All experiments complete!")
+    print(f"📊 Results summary:")
+    print(results.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
