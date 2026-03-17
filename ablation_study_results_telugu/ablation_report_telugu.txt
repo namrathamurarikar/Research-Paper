@@ -1,0 +1,8 @@
+ABLATION STUDY REPORT: Telugu
+======================================================================
+
+    experiment  use_focal_loss  use_llrd  use_filtering  accuracy       f1  precision   recall
+  FL_LLRD_Filt            True      True           True  0.960916 0.885375   0.829630 0.949153
+  CE_LLRD_Filt           False      True           True  0.974394 0.917749   0.938053 0.898305
+FL_NoLLRD_Filt            True     False           True  0.959569 0.880952   0.828358 0.940678
+FL_LLRD_NoFilt            True      True          False  0.959569 0.880952   0.828358 0.940678
